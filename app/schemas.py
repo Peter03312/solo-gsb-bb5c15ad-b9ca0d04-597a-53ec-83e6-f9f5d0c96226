@@ -18,6 +18,9 @@ class ReleaseItem(StrictModel):
     body: str = Field(..., description="规程正文")
     valid_start: str = Field(..., description="UTC 适用区间起点（含），ISO-8601 带时区")
     valid_end: str = Field(..., description="UTC 适用区间终点（不含），ISO-8601 带时区")
+    prerequisites: list[str] | None = Field(
+        None, description="前置规程编号列表；省略视为空。编号可尚未发布"
+                          "（前置可晚于引用者发布），但不得含空白或重复编号")
 
 
 class ReleaseBatch(StrictModel):
@@ -30,6 +33,9 @@ class CorrectionItem(StrictModel):
     valid_start: str = Field(..., description="子区间起点（含），ISO-8601 带时区")
     valid_end: str = Field(..., description="子区间终点（不含），ISO-8601 带时区")
     body: str = Field(..., description="新正文（仅覆盖该子区间）")
+    prerequisites: list[str] | None = Field(
+        None, description="前置规程编号列表；省略继承被替代版本的前置列表，"
+                          "显式空列表清空。编号可尚未发布，但不得含空白或重复编号")
 
 
 class CorrectionBatch(StrictModel):

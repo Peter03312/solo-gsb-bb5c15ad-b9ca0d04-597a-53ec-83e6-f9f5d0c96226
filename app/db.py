@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS versions (
 -- 撤回事件：只追加，不删除/改写 versions 行。
 -- 一个版本至多被撤回一次（UNIQUE）；撤回时刻 withdrawn_at 由服务端记录，不可回填。
 -- 双时间维语义：知悉时刻 k 下该版本可见当且仅当
--- published_at <= k 且（未撤回 或 withdrawn_at > k）。
+-- published_at <= k 且（未撤回 或 withdrawn_at >= k）。
 CREATE TABLE IF NOT EXISTS withdrawals (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     version_id   INTEGER NOT NULL UNIQUE REFERENCES versions(id),
@@ -70,6 +70,19 @@ CREATE TABLE IF NOT EXISTS package_items (
     UNIQUE(package_id, position)
 );
 
+-- 版本前置规程：每个版本创建时（首次发布/更正）记录其前置规程编号列表。
+-- 只随版本行一起插入、从不改写：引用关系因此随版本的适用区间、发布时间与
+-- 撤回自然变化（可见性由 versions/withdrawals 的双时间维语义决定），历史不变。
+-- 前置编号不做外键：允许引用尚未发布的规程（前置可晚于引用者发布）；
+-- 既有版本没有前置行，读取时视为空列表（旧数据保持可用）。
+CREATE TABLE IF NOT EXISTS version_prerequisites (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id INTEGER NOT NULL REFERENCES versions(id),
+    position   INTEGER NOT NULL,
+    number     TEXT NOT NULL,
+    UNIQUE(version_id, position)
+);
+
 CREATE INDEX IF NOT EXISTS idx_versions_procedure
     ON versions(procedure_id);
 CREATE INDEX IF NOT EXISTS idx_versions_query
@@ -78,6 +91,8 @@ CREATE INDEX IF NOT EXISTS idx_withdrawals_version
     ON withdrawals(version_id);
 CREATE INDEX IF NOT EXISTS idx_package_items_package
     ON package_items(package_id);
+CREATE INDEX IF NOT EXISTS idx_version_prerequisites_version
+    ON version_prerequisites(version_id);
 """
 
 _write_lock = threading.Lock()

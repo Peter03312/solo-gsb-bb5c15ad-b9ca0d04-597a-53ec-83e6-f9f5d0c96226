@@ -194,3 +194,50 @@ def review_known_too_early(known_as_of: str, package_known: str) -> DomainError:
         http_status=422,
         details={"known_as_of": known_as_of,
                  "package_known_as_of": package_known})
+
+
+# ---------------------------------------------------------------- 前置规程闭包
+
+
+def duplicate_prerequisite_number(number: str, at_index: int | None,
+                                  position: int) -> DomainError:
+    details: dict = {"number": number, "position": position}
+    if at_index is not None:
+        details["index"] = at_index
+    return DomainError(
+        "duplicate_prerequisite_number",
+        f"前置规程编号 {number} 在列表中重复出现（第 {position} 项），"
+        f"前置规程列表不得含空白或重复编号",
+        http_status=422, details=details)
+
+
+def prerequisite_not_found(number: str, referenced_by: str) -> DomainError:
+    return DomainError(
+        "prerequisite_not_found",
+        f"规程 {referenced_by} 引用的前置规程 {number} 不存在，"
+        f"前置闭包存在缺口，整体失败",
+        http_status=404,
+        details={"number": number, "referenced_by": referenced_by})
+
+
+def closure_no_applicable_version(number: str, work_time: str,
+                                  known_as_of: str,
+                                  referenced_by: str | None) -> DomainError:
+    details: dict = {"number": number, "work_time": work_time,
+                     "known_as_of": known_as_of}
+    if referenced_by is not None:
+        details["referenced_by"] = referenced_by
+    via = f"（被规程 {referenced_by} 引用）" if referenced_by else ""
+    return DomainError(
+        "no_applicable_version",
+        f"规程 {number}{via} 在知悉时刻 {known_as_of} 下、对作业时刻 "
+        f"{work_time} 没有已发布且生效（未撤回）的适用正文，"
+        f"前置闭包存在缺口，整体失败",
+        http_status=409, details=details)
+
+
+def prerequisite_cycle(cycle: list[str]) -> DomainError:
+    return DomainError(
+        "prerequisite_cycle",
+        f"前置规程引用成环：{' -> '.join(cycle)}，无法解析完整清单",
+        http_status=409, details={"cycle": cycle})

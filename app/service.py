@@ -43,6 +43,23 @@
 - 复核：在显式只读快照事务内以复核知悉时刻（不早于包内知悉时刻、不晚于
   当前时刻）按原作业时刻逐项重新解析，给出包内版本 pinned、彼时有效版本
   current 与 changed，并汇总整体 all_match；是否变化只看版本号。
+
+前置规程闭包
+------------
+每个版本创建时可携带一份**前置规程编号列表**（``version_prerequisites``，
+只随版本插入、从不改写）：
+
+- 首次发布省略该字段视为空列表；更正省略则**继承被替代版本**的列表，
+  显式空列表表示清空；旧请求与既有数据（无前置行）均视为空列表；
+- 前置编号可引用尚未发布的规程（可晚于引用者发布），但列表不得含空白
+  或重复编号；
+- 引用挂在版本行上，因此随版本的适用区间、发布时间与撤回自然变化，
+  历史不被改写。
+
+闭包查询输入根编号、作业时刻与知悉时刻，在**同一只读快照**中按现有回溯
+语义递归解析：前置优先（每个规程排在其全部前置之后）、按编号去重、根在
+最后。根不存在、引用编号不存在或当时无适用正文均说明缺口并整体失败；
+引用成环返回环路径，不返回部分清单。
 """
 from __future__ import annotations
 
@@ -150,6 +167,29 @@ def _clean_number(value: str, index: int | None) -> str:
         raise DomainError("invalid_number", "规程编号不能为空字符串", 422, details)
     return number
 
+
+def _clean_prerequisites(raw_list: list, index: int | None) -> list[str]:
+    """校验并规范化前置规程编号列表：去首尾空白，拒绝空白项与重复项。
+
+    编号本身不要求已存在——前置规程允许晚于引用者发布，缺口在闭包
+    查询时按"引用编号不存在"报告。
+    """
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for pos, raw in enumerate(raw_list):
+        number = raw.strip() if isinstance(raw, str) else ""
+        if not number:
+            details: dict = {"field": "prerequisites", "position": pos}
+            if index is not None:
+                details["index"] = index
+            raise DomainError("invalid_number", "前置规程编号不能为空字符串",
+                              422, details)
+        if number in seen:
+            raise errors.duplicate_prerequisite_number(number, index, pos)
+        seen.add(number)
+        cleaned.append(number)
+    return cleaned
+
 # ---------------------------------------------------------------- 行读取
 
 
@@ -219,41 +259,72 @@ def _remaining(conn: sqlite3.Connection,
              if c["id"] not in withdrawn]
     return _subtract_intervals((base["valid_start"], base["valid_end"]), holes)
 
+# ---------------------------------------------------------------- 前置规程
+
+
+def _prerequisites_of(conn: sqlite3.Connection, version_id: int) -> list[str]:
+    """某版本创建时记录的前置规程编号列表（按声明顺序）。
+
+    既有数据没有前置行，返回空列表（旧数据保持可用）。
+    """
+    rows = conn.execute(
+        "SELECT number FROM version_prerequisites WHERE version_id = ? "
+        "ORDER BY position", (version_id,)).fetchall()
+    return [r["number"] for r in rows]
+
+
+def _insert_prerequisites(conn: sqlite3.Connection, version_id: int,
+                          numbers: list[str]) -> None:
+    """随版本行一同写入其前置规程编号列表（只插入，从不改写）。"""
+    for pos, number in enumerate(numbers):
+        conn.execute(
+            "INSERT INTO version_prerequisites (version_id, position, number) "
+            "VALUES (?, ?, ?)", (version_id, pos, number))
+
 # ---------------------------------------------------------------- 首次发布
 
 
 def publish_releases(items: list) -> dict:
-    """首次发布一个或多个规程；整批原子提交。"""
-    normalized: list[tuple[str, str, str, str]] = []
+    """首次发布一个或多个规程；整批原子提交。
+
+    每个版本可携带前置规程编号列表（省略视为空）；编号可尚未发布，
+    但列表不得含空白或重复编号，任一非法整批拒绝、不写任何历史。
+    """
+    normalized: list[tuple[str, str, str, str, list[str]]] = []
     seen: set[str] = set()
     for i, item in enumerate(items):
         number = _clean_number(item.number, i)
         body = _clean_text(item.body, "body", i)
         start, end = _validated_interval(item.valid_start, item.valid_end, i)
+        # 首次发布省略前置列表视为空（旧请求不带该字段，保持可用）
+        prereqs = _clean_prerequisites(
+            getattr(item, "prerequisites", None) or [], i)
         if number in seen:
             raise errors.duplicate_number(number, i)
         seen.add(number)
-        normalized.append((number, body, start, end))
+        normalized.append((number, body, start, end, prereqs))
 
     with write_tx() as conn:
         published_at = _server_now()
         created: list[dict] = []
-        for i, (number, body, start, end) in enumerate(normalized):
+        for i, (number, body, start, end, _prereqs) in enumerate(normalized):
             if _fetch_procedure(conn, number) is not None:
                 raise errors.duplicate_number(number, i)
-        for number, body, start, end in normalized:
+        for number, body, start, end, prereqs in normalized:
             cur = conn.execute(
                 "INSERT INTO procedures (number, created_at) VALUES (?, ?)",
                 (number, published_at))
             proc_id = cur.lastrowid
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO versions (procedure_id, revision, body, "
                 "valid_start, valid_end, supersedes_id, published_at) "
                 "VALUES (?, 0, ?, ?, ?, NULL, ?)",
                 (proc_id, body, start, end, published_at))
+            _insert_prerequisites(conn, cur.lastrowid, prereqs)
             created.append({"number": number, "revision": 0, "body": body,
                             "valid_start": start, "valid_end": end,
-                            "published_at": published_at})
+                            "published_at": published_at,
+                            "prerequisites": prereqs})
     return {"published_at": published_at, "items": created}
 
 # ---------------------------------------------------------------- 更正提交
@@ -264,6 +335,9 @@ def submit_corrections(items: list) -> dict:
 
     同批次内条目按顺序处理，因此第 k 条可以以同批次更早插入的新版本为基版
     （此时 revision 号为可预知的该规程当前最大号 +1）。
+
+    前置规程编号列表：省略 -> 继承被替代版本；显式空列表 -> 清空；
+    显式非空列表 -> 使用新列表（不得含空白或重复编号）。
     """
     with write_tx() as conn:
         published_at = _server_now()
@@ -275,6 +349,10 @@ def submit_corrections(items: list) -> dict:
             number = _clean_number(item.number, i)
             body = _clean_text(item.body, "body", i)
             sub = _validated_interval(item.valid_start, item.valid_end, i)
+            # 前置规程：显式给出（含空列表）时先校验；省略则稍后继承被替代版本
+            raw_prereqs = getattr(item, "prerequisites", None)
+            explicit_prereqs = (None if raw_prereqs is None
+                                else _clean_prerequisites(raw_prereqs, i))
 
             proc = _fetch_procedure(conn, number)
             if proc is None:
@@ -321,17 +399,24 @@ def submit_corrections(items: list) -> dict:
                 "FROM versions WHERE procedure_id = ?", (proc_id,)).fetchone()
             new_revision = row["next_revision"]
 
-            conn.execute(
+            # 省略 -> 继承被替代版本的前置列表；显式空列表 -> 清空；
+            # 显式非空列表 -> 使用新列表（已在校验阶段规范化）。
+            prereqs = (explicit_prereqs if explicit_prereqs is not None
+                       else _prerequisites_of(conn, base["id"]))
+
+            cur = conn.execute(
                 "INSERT INTO versions (procedure_id, revision, body, "
                 "valid_start, valid_end, supersedes_id, published_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (proc_id, new_revision, body, sub[0], sub[1],
                  base["id"], published_at))
+            _insert_prerequisites(conn, cur.lastrowid, prereqs)
             pending.setdefault(key, []).append(sub)
             created.append({"number": number, "revision": new_revision,
                             "supersedes_revision": item.base_revision,
                             "body": body, "valid_start": sub[0],
-                            "valid_end": sub[1], "published_at": published_at})
+                            "valid_end": sub[1], "published_at": published_at,
+                            "prerequisites": prereqs})
 
     return {"published_at": published_at, "items": created}
 
@@ -620,7 +705,12 @@ def list_history(number_raw: str) -> dict:
                     parent_rev[prow["id"]] = prow["revision"]
         # 撤回版本与撤回时刻对审计可见（撤回只追加事件、版本行仍在）。
         withdrawn = _withdrawn_map(conn, [r["id"] for r in rows])
-        items = [_serialize(r, parent_rev, withdrawn) for r in rows]
+        items = []
+        for r in rows:
+            payload = _serialize(r, parent_rev, withdrawn)
+            # 审计视图同时给出该版本创建时记录的前置规程列表
+            payload["prerequisites"] = _prerequisites_of(conn, r["id"])
+            items.append(payload)
     return {"number": number, "count": len(items), "items": items}
 
 
@@ -735,6 +825,79 @@ def compare_interval(number_raw: str,
             "work_end": work_end,
             "count": len(segments),
             "segments": segments}
+
+
+# ---------------------------------------------------------------- 前置规程闭包
+
+
+def resolve_closure(root_raw: str, work_time_raw: str,
+                    known_as_of_raw: str | None) -> dict:
+    """递归解析根规程及其前置规程在 (作业时刻, 知悉时刻) 下的适用版本清单。
+
+    语义与回溯查询完全一致：每个规程沿现有双时间维约定取当时适用版本
+    （已发布、未撤回或撤回不早于知悉时刻、覆盖作业时刻的链上最深版本），
+    再按该版本创建时记录的前置列表递归展开。整个解析在同一只读快照事务内
+    完成，不会拼接并发写入前后的结果。
+
+    返回清单前置优先（每个规程排在其全部前置之后）、按编号去重、根在最后；
+    任一缺口（根或引用编号不存在、当时无适用正文）或引用环均整体失败，
+    不返回部分清单。
+    """
+    root = root_raw.strip()
+    try:
+        work_time = parse_canonical(work_time_raw, "work_time")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422, {"field": "work_time"})
+    if known_as_of_raw is None or not str(known_as_of_raw).strip():
+        known_as_of = now_canonical()
+    else:
+        try:
+            known_as_of = parse_canonical(known_as_of_raw, "known_as_of")
+        except TimeParseError as exc:
+            raise DomainError("invalid_time", str(exc), 422,
+                              {"field": "known_as_of"})
+
+    with read_snapshot() as conn:
+        if not root:
+            raise DomainError("not_found", "规程编号 (空) 不存在", 404,
+                              {"number": ""})
+        items: list[dict] = []
+        state: dict[str, str] = {}          # 编号 -> "visiting" | "done"
+
+        def visit(number: str, stack: list[str]) -> None:
+            status = state.get(number)
+            if status == "done":
+                return                      # 去重：该编号已展开过
+            if status == "visiting":
+                # 引用环：报告从该编号出发回到自身的完整路径，不返回部分清单
+                raise errors.prerequisite_cycle(
+                    stack[stack.index(number):] + [number])
+            referenced_by = stack[-1] if stack else None
+            proc = _fetch_procedure(conn, number)
+            if proc is None:
+                if referenced_by is None:
+                    raise DomainError("not_found",
+                                      f"规程编号 {number} 不存在", 404,
+                                      {"number": number})
+                raise errors.prerequisite_not_found(number, referenced_by)
+            best, parent_rev = _resolve_effective(
+                conn, proc, work_time, known_as_of)
+            if best is None:
+                raise errors.closure_no_applicable_version(
+                    number, work_time, known_as_of, referenced_by)
+            state[number] = "visiting"
+            prereqs = _prerequisites_of(conn, best["id"])
+            for prereq in prereqs:
+                visit(prereq, stack + [number])
+            state[number] = "done"
+            payload = _version_payload(best, number, parent_rev)
+            payload["prerequisites"] = prereqs
+            items.append(payload)
+
+        visit(root, [])
+
+    return {"root": root, "work_time": work_time, "known_as_of": known_as_of,
+            "count": len(items), "items": items}
 
 
 # ---------------------------------------------------------------- 作业规程包

@@ -122,6 +122,114 @@ def main() -> None:
     # 11) 作业规程包的固定、取回与复核（独立规程演示，见 _package_examples）
     _package_examples()
 
+    # 12) 前置规程闭包（本轮新增；独立规程演示，见 _closure_examples）
+    _closure_examples()
+
+
+def _closure_examples() -> None:
+    """前置规程闭包：版本级前置引用 + 按根规程递归核对当时有效的前置清单。"""
+    root, mid, base = "SOP-DEMO-CL-001", "SOP-DEMO-CL-002", "SOP-DEMO-CL-003"
+
+    # 12.1) 前置可晚于引用者发布：先发布根规程并声明前置（此时前置尚不存在）
+    status, res = call("POST", "/api/v1/releases", {
+        "number": root,
+        "body": "根规程：高处作业须按本规程执行。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": [mid, base],
+    })
+    show("12.1 首次发布携带前置规程列表（前置尚未发布也允许）", status, res)
+
+    # 12.2) 此时闭包存在缺口：引用的前置编号不存在 -> 404，不返回部分清单
+    status, res = call(
+        "GET", f"/api/v1/procedures/{root}/closure"
+               "?work_time=2026-03-15T08:00:00Z")
+    show("12.2 前置未发布 -> 404 prerequisite_not_found（说明缺口）", status, res)
+
+    # 12.3) 补齐前置规程（中间规程再引用基础规程，演示递归与去重）
+    call("POST", "/api/v1/releases", {
+        "number": base,
+        "body": "基础规程：进入车间必须佩戴护目镜。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+    })
+    call("POST", "/api/v1/releases", {
+        "number": mid,
+        "body": "中间规程：动火作业须办理动火证。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": [base],
+    })
+
+    # 12.4) 闭包查询：前置优先、按编号去重、根在最后，含编号/版本/正文
+    status, res = call(
+        "GET", f"/api/v1/procedures/{root}/closure"
+               "?work_time=2026-03-15T08:00:00Z")
+    show("12.4 闭包查询（前置优先 + 去重，根在最后）", status, res)
+
+    # 12.5) 更正省略前置列表 -> 继承被替代版本；显式空列表 -> 清空
+    status, res = call("POST", "/api/v1/corrections", {
+        "number": root,
+        "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end": "2026-04-01T00:00:00Z",
+        "body": "根规程 3 月版：大风天停止高处作业。",
+    })
+    show("12.5a 更正省略前置 -> 继承被替代版本", status, res)
+    status, res = call("POST", "/api/v1/corrections", {
+        "number": root,
+        "base_revision": 1,
+        "valid_start": "2026-03-10T00:00:00Z",
+        "valid_end": "2026-03-20T00:00:00Z",
+        "body": "根规程 3 月中旬版：改按现场交底执行。",
+        "prerequisites": [],
+    })
+    show("12.5b 显式空列表 -> 清空前置", status, res)
+
+    # 12.6) 引用随版本适用区间变化：3 月中旬闭包只剩根规程自身
+    status, res = call(
+        "GET", f"/api/v1/procedures/{root}/closure"
+               "?work_time=2026-03-15T08:00:00Z")
+    show("12.6 3 月中旬（r2 生效、前置已清空）", status, res)
+
+    # 12.7) 历史审计：各版本创建时的前置列表（r0/r1 继承、r2 清空）
+    status, res = call("GET", f"/api/v1/procedures/{root}/history")
+    show("12.7 版本历史（各版本的前置列表）", status,
+         [{"revision": v["revision"], "prerequisites": v["prerequisites"]}
+          for v in res["items"]])
+
+    # 12.8) 各类拒绝：空白/重复编号、引用环
+    status, res = call("POST", "/api/v1/releases", {
+        "number": "SOP-DEMO-CL-BAD-1",
+        "body": "x",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": ["  "],
+    })
+    show("12.8a 前置编号为空白 -> 422 invalid_number", status, res)
+    status, res = call("POST", "/api/v1/releases", {
+        "number": "SOP-DEMO-CL-BAD-2",
+        "body": "x",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": ["SOP-DEMO-CL-003", "SOP-DEMO-CL-003"],
+    })
+    show("12.8b 前置编号重复 -> 422 duplicate_prerequisite_number", status, res)
+    call("POST", "/api/v1/releases", {
+        "number": "SOP-DEMO-CL-CYC-A", "body": "A",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": ["SOP-DEMO-CL-CYC-B"]})
+    call("POST", "/api/v1/releases", {
+        "number": "SOP-DEMO-CL-CYC-B", "body": "B",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": ["SOP-DEMO-CL-CYC-A"]})
+    status, res = call(
+        "GET", "/api/v1/procedures/SOP-DEMO-CL-CYC-A/closure"
+               "?work_time=2026-03-15T08:00:00Z")
+    show("12.8c 引用环 -> 409 prerequisite_cycle（返回环路径）", status, res)
+
 
 def _withdrawal_examples() -> None:
     """撤回示例：撤回只追加事件，撤回前历史不变，撤回后区间恢复父版本正文。"""
