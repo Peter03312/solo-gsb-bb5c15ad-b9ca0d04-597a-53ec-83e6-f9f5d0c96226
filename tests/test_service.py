@@ -37,6 +37,7 @@ def reset_db() -> None:
     try:
         conn.execute("PRAGMA foreign_keys = OFF")
         conn.executescript(
+            "DELETE FROM prerequisites; "
             "DELETE FROM package_items; DELETE FROM packages; "
             "DELETE FROM versions; DELETE FROM procedures;")
         conn.commit()
@@ -65,20 +66,26 @@ future = iso(_T + timedelta(days=400))
 
 
 def item(number: str, body: str = "v0", start: str = t1, end: str = t5,
-         base: int | None = None):
+         base: int | None = None, prerequisites=None):
     data = {"number": number, "body": body,
             "valid_start": start, "valid_end": end}
     if base is not None:
         data["base_revision"] = base
+    if prerequisites is not None:
+        data["prerequisites"] = prerequisites
     return SimpleNamespace(**data)
 
 
-def release(number: str, start: str = t1, end: str = t5, body: str = "初版"):
-    return service.publish_releases([item(number, body, start, end)])
+def release(number: str, start: str = t1, end: str = t5, body: str = "初版",
+            prerequisites=None):
+    return service.publish_releases(
+        [item(number, body, start, end, prerequisites=prerequisites)])
 
 
-def correct(number: str, base: int, start: str, end: str, body: str = "更正"):
-    return service.submit_corrections([item(number, body, start, end, base)])
+def correct(number: str, base: int, start: str, end: str, body: str = "更正",
+            prerequisites=None):
+    return service.submit_corrections(
+        [item(number, body, start, end, base, prerequisites=prerequisites)])
 
 
 def witem(number: str, revision: int):
@@ -928,6 +935,302 @@ class PackageTests(unittest.TestCase):
         self.assertFalse(by_no["P-1"]["changed"])
 
 
+class PrerequisiteTests(unittest.TestCase):
+    """前置规程：发布/更正携带前置编号列表，按版本生效，递归解析闭包。"""
+
+    def setUp(self):
+        reset_db()
+
+    def _closure(self, number: str, work: str = t2, known: str = future):
+        return service.resolve_closure(number, work, known)
+
+    def _closure_numbers(self, number: str, work: str = t2,
+                         known: str = future) -> list[str]:
+        return [i["number"] for i in self._closure(number, work, known)["items"]]
+
+    # ---- 写入：携带 / 省略 / 继承 / 清空 --------------------------------
+
+    def test_release_with_prerequisites_returned_and_stored(self):
+        res = release("PRE-W-1", prerequisites=["PRE-A", "PRE-B"])
+        self.assertEqual(res["items"][0]["prerequisites"], ["PRE-A", "PRE-B"])
+        history = service.list_history("PRE-W-1")
+        self.assertEqual(history["items"][0]["prerequisites"],
+                         ["PRE-A", "PRE-B"])
+
+    def test_release_omitting_prerequisites_defaults_empty(self):
+        res = release("PRE-W-2")
+        self.assertEqual(res["items"][0]["prerequisites"], [])
+        self.assertEqual(
+            service.list_history("PRE-W-2")["items"][0]["prerequisites"], [])
+
+    def test_correction_inherits_base_list_when_omitted(self):
+        release("PRE-W-3", prerequisites=["PRE-A", "PRE-B"])
+        res = correct("PRE-W-3", 0, t2, t3, "三月版")
+        self.assertEqual(res["items"][0]["prerequisites"], ["PRE-A", "PRE-B"])
+        history = {v["revision"]: v for v in
+                   service.list_history("PRE-W-3")["items"]}
+        self.assertEqual(history[0]["prerequisites"], ["PRE-A", "PRE-B"])
+        self.assertEqual(history[1]["prerequisites"], ["PRE-A", "PRE-B"])
+
+    def test_correction_explicit_empty_list_clears(self):
+        release("PRE-W-4", prerequisites=["PRE-A"])
+        res = correct("PRE-W-4", 0, t2, t3, "三月版", prerequisites=[])
+        self.assertEqual(res["items"][0]["prerequisites"], [])
+        history = {v["revision"]: v for v in
+                   service.list_history("PRE-W-4")["items"]}
+        self.assertEqual(history[0]["prerequisites"], ["PRE-A"])
+        self.assertEqual(history[1]["prerequisites"], [])
+
+    def test_correction_explicit_list_replaces(self):
+        release("PRE-W-5", prerequisites=["PRE-A"])
+        res = correct("PRE-W-5", 0, t2, t3, "三月版",
+                      prerequisites=["PRE-B", "PRE-C"])
+        self.assertEqual(res["items"][0]["prerequisites"],
+                         ["PRE-B", "PRE-C"])
+        # 链式：r2 省略 -> 继承 r1 的显式列表，而非 r0 的
+        res2 = correct("PRE-W-5", 1, t2, t3, "三月再更正")
+        self.assertEqual(res2["items"][0]["prerequisites"],
+                         ["PRE-B", "PRE-C"])
+
+    def test_old_style_items_without_field_still_work(self):
+        # 旧调用方构造的对象没有 prerequisites 属性：按省略处理
+        release("PRE-W-6")
+        res = correct("PRE-W-6", 0, t2, t3, "三月版")
+        self.assertEqual(res["items"][0]["prerequisites"], [])
+
+    # ---- 写入校验：空白 / 重复 / 批量原子 --------------------------------
+
+    def test_blank_prerequisite_rejected(self):
+        with self.assertRaises(DomainError) as ctx:
+            release("PRE-BAD-1", prerequisites=["PRE-A", "  "])
+        self.assertEqual(ctx.exception.code, "invalid_number")
+        self.assertEqual(ctx.exception.http_status, 422)
+        self.assertEqual(ctx.exception.details["field"], "prerequisites")
+        self.assertEqual(ctx.exception.details["position"], 1)
+        with self.assertRaises(DomainError) as ctx:
+            release("PRE-BAD-2", prerequisites=[""])
+        self.assertEqual(ctx.exception.code, "invalid_number")
+
+    def test_duplicate_prerequisite_rejected(self):
+        with self.assertRaises(DomainError) as ctx:
+            release("PRE-BAD-3", prerequisites=["PRE-A", "PRE-B", "PRE-A"])
+        self.assertEqual(ctx.exception.code, "duplicate_prerequisite_number")
+        self.assertEqual(ctx.exception.http_status, 422)
+        self.assertEqual(ctx.exception.details["number"], "PRE-A")
+        self.assertEqual(ctx.exception.details["position"], 2)
+        # 更正中同样校验
+        release("PRE-BAD-4")
+        with self.assertRaises(DomainError) as ctx:
+            correct("PRE-BAD-4", 0, t2, t3, "x",
+                    prerequisites=["PRE-A", "PRE-A"])
+        self.assertEqual(ctx.exception.code, "duplicate_prerequisite_number")
+
+    def test_invalid_prerequisite_batch_atomic(self):
+        # 批量发布：第二条前置重复 -> 整批回滚，第一条也不入库
+        with self.assertRaises(DomainError) as ctx:
+            service.publish_releases([
+                item("PRE-BAT-1", prerequisites=["PRE-A"]),
+                item("PRE-BAT-2", prerequisites=["PRE-X", "PRE-X"]),
+            ])
+        self.assertEqual(ctx.exception.code, "duplicate_prerequisite_number")
+        self.assertEqual(ctx.exception.details["index"], 1)
+        with self.assertRaises(DomainError):
+            service.list_history("PRE-BAT-1")
+        # 批量更正同理：第二条非法 -> 第一条更正也不入库
+        release("PRE-BAT-3")
+        with self.assertRaises(DomainError):
+            service.submit_corrections([
+                item("PRE-BAT-3", "ok", t2, t3, base=0),
+                item("PRE-BAT-3", "bad", t3, t4, base=0,
+                     prerequisites=[" "]),
+            ])
+        self.assertEqual(service.list_history("PRE-BAT-3")["count"], 1)
+
+    def test_reference_may_be_published_later(self):
+        # 写入时不校验存在性：引用尚未发布的编号合法
+        release("PRE-LATE-ROOT", prerequisites=["PRE-LATE"])
+        with self.assertRaises(DomainError) as ctx:
+            self._closure("PRE-LATE-ROOT")
+        self.assertEqual(ctx.exception.code, "prerequisite_not_found")
+        # 前置发布后解析成功
+        release("PRE-LATE", body="前置正文")
+        items = self._closure("PRE-LATE-ROOT")["items"]
+        self.assertEqual([i["number"] for i in items],
+                         ["PRE-LATE", "PRE-LATE-ROOT"])
+        self.assertEqual(items[0]["body"], "前置正文")
+
+    # ---- 递归解析：顺序 / 去重 / 版本选取 --------------------------------
+
+    def test_closure_prerequisites_first_root_last_dedup(self):
+        # 菱形：ROOT -> [B, C]，B -> [D]，C -> [D]
+        release("PRE-D", body="D正文")
+        release("PRE-B", body="B正文", prerequisites=["PRE-D"])
+        release("PRE-C", body="C正文", prerequisites=["PRE-D"])
+        release("PRE-ROOT", body="根正文",
+                prerequisites=["PRE-B", "PRE-C", "PRE-D"])
+        res = self._closure("PRE-ROOT")
+        self.assertEqual(res["root"], "PRE-ROOT")
+        self.assertEqual(res["count"], 4)
+        # 前置优先、根最后；D 被三处引用只出现一次
+        self.assertEqual([i["number"] for i in res["items"]],
+                         ["PRE-D", "PRE-B", "PRE-C", "PRE-ROOT"])
+        self.assertEqual(res["items"][0]["body"], "D正文")
+        self.assertEqual(res["items"][-1]["body"], "根正文")
+        # 清单项含编号、版本、正文与各自携带的前置列表
+        self.assertEqual(res["items"][-1]["revision"], 0)
+        self.assertEqual(res["items"][-1]["prerequisites"],
+                         ["PRE-B", "PRE-C", "PRE-D"])
+        self.assertEqual(res["items"][0]["prerequisites"], [])
+        self.assertEqual(res["work_time"], canon(t2))
+        self.assertEqual(res["known_as_of"], canon(future))
+
+    def test_closure_deep_chain(self):
+        release("PRE-L3", body="L3")
+        release("PRE-L2", body="L2", prerequisites=["PRE-L3"])
+        release("PRE-L1", body="L1", prerequisites=["PRE-L2"])
+        release("PRE-L0", body="L0", prerequisites=["PRE-L1"])
+        self.assertEqual(self._closure_numbers("PRE-L0"),
+                         ["PRE-L3", "PRE-L2", "PRE-L1", "PRE-L0"])
+
+    def test_closure_uses_effective_version_at_work_time(self):
+        # 前置规程自身在作业时刻适用的是更正版本
+        release("PRE-E", body="前置初版")
+        correct("PRE-E", 0, t2, t3, "前置三月版")
+        release("PRE-R", body="根", prerequisites=["PRE-E"])
+        # 作业时刻在 3 月（t2..t3）-> 前置取 r1
+        items = self._closure("PRE-R", work=t2)["items"]
+        self.assertEqual(items[0]["revision"], 1)
+        self.assertEqual(items[0]["body"], "前置三月版")
+        # 作业时刻在 4 月（t3..t4）-> 前置回到 r0
+        items = self._closure("PRE-R", work=t3)["items"]
+        self.assertEqual(items[0]["revision"], 0)
+        self.assertEqual(items[0]["body"], "前置初版")
+
+    def test_closure_references_follow_version_and_known_time(self):
+        # 引用随版本的适用区间与发布时间变化：根 r0 带 [PRE-1]，
+        # 3 月更正 r1 改为 []（清空）
+        release("PRE-1", body="前置")
+        release("PRE-R2", body="根初版", prerequisites=["PRE-1"])
+        published = correct("PRE-R2", 0, t2, t3, "根三月版",
+                            prerequisites=[])["published_at"]
+        # 3 月作业：根的适用版本是 r1（已清空前置）-> 只有根
+        self.assertEqual(self._closure_numbers("PRE-R2", work=t2),
+                         ["PRE-R2"])
+        # 2 月作业：根的适用版本是 r0 -> 带前置
+        self.assertEqual(
+            self._closure_numbers("PRE-R2",
+                                  work=iso(_T + timedelta(days=15))),
+            ["PRE-1", "PRE-R2"])
+        # 知悉时刻早于更正发布：3 月作业仍按 r0 -> 带前置（历史不变）
+        dt = datetime.strptime(published, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc)
+        before = iso_us(dt - timedelta(microseconds=1))
+        self.assertEqual(self._closure_numbers("PRE-R2", work=t2,
+                                               known=before),
+                         ["PRE-1", "PRE-R2"])
+
+    def test_closure_references_follow_withdrawal(self):
+        # 撤回更正后，其前置列表随之失效，恢复父版本携带的列表
+        release("PRE-1", body="前置")
+        release("PRE-R3", body="根初版", prerequisites=["PRE-1"])
+        correct("PRE-R3", 0, t2, t3, "根三月版", prerequisites=[])
+        self.assertEqual(self._closure_numbers("PRE-R3", work=t2),
+                         ["PRE-R3"])
+        withdraw("PRE-R3", 1)
+        self.assertEqual(self._closure_numbers("PRE-R3", work=t2),
+                         ["PRE-1", "PRE-R3"])
+
+    def test_closure_known_as_of_defaults_now(self):
+        release("PRE-N1", body="前置")
+        release("PRE-N2", body="根", prerequisites=["PRE-N1"])
+        res = service.resolve_closure("PRE-N2", t2, None)
+        self.assertEqual([i["number"] for i in res["items"]],
+                         ["PRE-N1", "PRE-N2"])
+
+    # ---- 缺口与环：整体失败 ----------------------------------------------
+
+    def test_root_not_found(self):
+        with self.assertRaises(DomainError) as ctx:
+            self._closure("PRE-NOPE")
+        self.assertEqual(ctx.exception.code, "not_found")
+        self.assertEqual(ctx.exception.http_status, 404)
+        self.assertEqual(ctx.exception.details["number"], "PRE-NOPE")
+
+    def test_missing_reference_reports_gap_path(self):
+        release("PRE-G1", prerequisites=["PRE-G2", "PRE-G-MISSING"])
+        release("PRE-G2", prerequisites=["PRE-G3-MISSING"])
+        # 先展开 PRE-G2 -> 缺口在 PRE-G3-MISSING，引用链带到缺口
+        with self.assertRaises(DomainError) as ctx:
+            self._closure("PRE-G1")
+        self.assertEqual(ctx.exception.code, "prerequisite_not_found")
+        self.assertEqual(ctx.exception.http_status, 404)
+        self.assertEqual(ctx.exception.details["number"], "PRE-G3-MISSING")
+        self.assertEqual(ctx.exception.details["path"],
+                         ["PRE-G1", "PRE-G2", "PRE-G3-MISSING"])
+
+    def test_no_applicable_version_root_and_reference(self):
+        # 根在作业时刻无适用正文
+        release("PRE-X1", start=t2, end=t3)
+        with self.assertRaises(DomainError) as ctx:
+            self._closure("PRE-X1", work=t4)
+        self.assertEqual(ctx.exception.code, "no_applicable_version")
+        self.assertEqual(ctx.exception.http_status, 409)
+        self.assertEqual(ctx.exception.details["number"], "PRE-X1")
+        self.assertEqual(ctx.exception.details["path"], ["PRE-X1"])
+        # 前置在作业时刻无适用正文（前置区间只覆盖 3 月，作业在 4 月）
+        release("PRE-X2", start=t2, end=t3, body="前置仅 3 月")
+        release("PRE-X3", prerequisites=["PRE-X2"])
+        with self.assertRaises(DomainError) as ctx:
+            self._closure("PRE-X3", work=t4)
+        self.assertEqual(ctx.exception.code, "no_applicable_version")
+        self.assertEqual(ctx.exception.details["number"], "PRE-X2")
+        self.assertEqual(ctx.exception.details["path"],
+                         ["PRE-X3", "PRE-X2"])
+        # 知悉时刻早于前置发布：同样视为当时无适用正文
+        release("PRE-X4")
+        release("PRE-X5", prerequisites=["PRE-X4"])
+        with self.assertRaises(DomainError) as ctx:
+            self._closure("PRE-X5", known=t0)
+        self.assertEqual(ctx.exception.code, "no_applicable_version")
+        self.assertEqual(ctx.exception.details["number"], "PRE-X5")
+
+    def test_cycle_returns_cycle_path(self):
+        release("PRE-CY-A", prerequisites=["PRE-CY-B"])
+        release("PRE-CY-B", prerequisites=["PRE-CY-C"])
+        release("PRE-CY-C", prerequisites=["PRE-CY-A"])
+        with self.assertRaises(DomainError) as ctx:
+            self._closure("PRE-CY-A")
+        self.assertEqual(ctx.exception.code, "prerequisite_cycle")
+        self.assertEqual(ctx.exception.http_status, 409)
+        self.assertEqual(ctx.exception.details["cycle"],
+                         ["PRE-CY-A", "PRE-CY-B", "PRE-CY-C", "PRE-CY-A"])
+        # 从环外引用环：环路径从入环处开始
+        release("PRE-CY-ROOT", prerequisites=["PRE-CY-B"])
+        with self.assertRaises(DomainError) as ctx:
+            self._closure("PRE-CY-ROOT")
+        self.assertEqual(ctx.exception.details["cycle"],
+                         ["PRE-CY-B", "PRE-CY-C", "PRE-CY-A", "PRE-CY-B"])
+
+    def test_self_cycle(self):
+        release("PRE-CY-S", prerequisites=["PRE-CY-S"])
+        with self.assertRaises(DomainError) as ctx:
+            self._closure("PRE-CY-S")
+        self.assertEqual(ctx.exception.code, "prerequisite_cycle")
+        self.assertEqual(ctx.exception.details["cycle"],
+                         ["PRE-CY-S", "PRE-CY-S"])
+
+    def test_invalid_time_rejected(self):
+        release("PRE-T1")
+        with self.assertRaises(DomainError) as ctx:
+            service.resolve_closure("PRE-T1", "2026-01-01T00:00:00", future)
+        self.assertEqual(ctx.exception.code, "invalid_time")
+        self.assertEqual(ctx.exception.details["field"], "work_time")
+        with self.assertRaises(DomainError) as ctx:
+            service.resolve_closure("PRE-T1", t2, "2026-01-01T00:00:00")
+        self.assertEqual(ctx.exception.code, "invalid_time")
+        self.assertEqual(ctx.exception.details["field"], "known_as_of")
+
+
 class ApiTests(unittest.TestCase):
     """FastAPI 层：仅在依赖可用时运行。"""
 
@@ -1305,6 +1608,123 @@ class ApiTests(unittest.TestCase):
         # 复核缺少必填参数 -> 422
         r = c.get(f"/api/v1/packages/{pkg['id']}/review")
         self.assertEqual(r.status_code, 422)
+
+    def test_prerequisites_and_closure_over_http(self):
+        c = self.client
+        pre = self._n() + "-PRE"
+        root = self._n() + "-ROOT"
+        c.post("/api/v1/releases", json={
+            "number": pre, "body": "前置正文", "valid_start": t1,
+            "valid_end": t5})
+        # 首次发布携带前置编号列表
+        r = c.post("/api/v1/releases", json={
+            "number": root, "body": "根初版", "valid_start": t1,
+            "valid_end": t5, "prerequisites": [pre]})
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json()["items"][0]["prerequisites"], [pre])
+
+        # 更正省略 -> 继承被替代版本的前置列表
+        r = c.post("/api/v1/corrections", json={
+            "number": root, "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "根三月版"})
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json()["items"][0]["prerequisites"], [pre])
+
+        # 递归解析：前置优先、根最后，含编号/版本/正文
+        r = c.get(f"/api/v1/procedures/{root}/closure",
+                  params={"work_time": t2})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["root"], root)
+        self.assertEqual([i["number"] for i in body["items"]], [pre, root])
+        self.assertEqual(body["items"][0]["body"], "前置正文")
+        self.assertEqual(body["items"][1]["revision"], 1)  # 3 月适用更正版
+        self.assertEqual(body["items"][1]["prerequisites"], [pre])
+
+        # 历史审计：每个版本各自的前置列表
+        r = c.get(f"/api/v1/procedures/{root}/history")
+        revs = {v["revision"]: v for v in r.json()["items"]}
+        self.assertEqual(revs[0]["prerequisites"], [pre])
+        self.assertEqual(revs[1]["prerequisites"], [pre])
+
+        # 显式空列表清空：4 月起的更正不再携带前置
+        r = c.post("/api/v1/corrections", json={
+            "number": root, "base_revision": 0,
+            "valid_start": t3, "valid_end": t4, "body": "根四月版",
+            "prerequisites": []})
+        self.assertEqual(r.json()["items"][0]["prerequisites"], [])
+        r = c.get(f"/api/v1/procedures/{root}/closure",
+                  params={"work_time": t3})
+        self.assertEqual([i["number"] for i in r.json()["items"]], [root])
+
+    def test_closure_errors_over_http(self):
+        c = self.client
+        n = self._n()
+        # 根不存在 -> 404 not_found
+        r = c.get(f"/api/v1/procedures/{n}/closure",
+                  params={"work_time": t2})
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "not_found")
+
+        # 引用编号不存在 -> 404 prerequisite_not_found（details 带引用链）
+        c.post("/api/v1/releases", json={
+            "number": n, "body": "根", "valid_start": t1, "valid_end": t5,
+            "prerequisites": ["NO-SUCH-PRE"]})
+        r = c.get(f"/api/v1/procedures/{n}/closure",
+                  params={"work_time": t2})
+        self.assertEqual(r.status_code, 404)
+        err = r.json()["error"]
+        self.assertEqual(err["code"], "prerequisite_not_found")
+        self.assertEqual(err["details"]["number"], "NO-SUCH-PRE")
+        self.assertEqual(err["details"]["path"], [n, "NO-SUCH-PRE"])
+
+        # 作业时刻无适用正文 -> 409 no_applicable_version
+        r = c.get(f"/api/v1/procedures/{n}/closure",
+                  params={"work_time": t5})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["code"], "no_applicable_version")
+
+        # 引用成环 -> 409 prerequisite_cycle（details 带环路径）
+        a, b = self._n() + "-A", self._n() + "-B"
+        c.post("/api/v1/releases", json={
+            "number": a, "body": "A", "valid_start": t1, "valid_end": t5,
+            "prerequisites": [b]})
+        c.post("/api/v1/releases", json={
+            "number": b, "body": "B", "valid_start": t1, "valid_end": t5,
+            "prerequisites": [a]})
+        r = c.get(f"/api/v1/procedures/{a}/closure",
+                  params={"work_time": t2})
+        self.assertEqual(r.status_code, 409)
+        err = r.json()["error"]
+        self.assertEqual(err["code"], "prerequisite_cycle")
+        self.assertEqual(err["details"]["cycle"], [a, b, a])
+
+        # 时间缺时区 -> 422 invalid_time；缺 work_time -> 422 validation_error
+        r = c.get(f"/api/v1/procedures/{n}/closure",
+                  params={"work_time": "2026-01-01T00:00:00"})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_time")
+        r = c.get(f"/api/v1/procedures/{n}/closure")
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "validation_error")
+
+        # 前置编号空白/重复 -> 422；旧式请求（不带 prerequisites）仍可用
+        r = c.post("/api/v1/releases", json={
+            "number": self._n(), "body": "x", "valid_start": t1,
+            "valid_end": t5, "prerequisites": [" "]})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_number")
+        r = c.post("/api/v1/releases", json={
+            "number": self._n(), "body": "x", "valid_start": t1,
+            "valid_end": t5, "prerequisites": ["P", "P"]})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"],
+                         "duplicate_prerequisite_number")
+        r = c.post("/api/v1/releases", json={
+            "number": self._n(), "body": "旧式", "valid_start": t1,
+            "valid_end": t5})
+        self.assertEqual(r.status_code, 201)
+        self.assertEqual(r.json()["items"][0]["prerequisites"], [])
 
 
 if __name__ == "__main__":

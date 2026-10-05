@@ -194,3 +194,47 @@ def review_known_too_early(known_as_of: str, package_known: str) -> DomainError:
         http_status=422,
         details={"known_as_of": known_as_of,
                  "package_known_as_of": package_known})
+
+
+# ---------------------------------------------------------------- 前置规程
+
+
+def duplicate_prerequisite_number(number: str, at_index: int | None,
+                                  position: int) -> DomainError:
+    details: dict = {"number": number, "position": position}
+    if at_index is not None:
+        details["index"] = at_index
+    return DomainError(
+        "duplicate_prerequisite_number",
+        f"前置规程编号 {number} 在列表中重复出现（第 {position} 项），"
+        f"前置编号列表必须互不相同",
+        http_status=422, details=details)
+
+
+def prerequisite_not_found(number: str, path: list[str]) -> DomainError:
+    return DomainError(
+        "prerequisite_not_found",
+        f"前置规程编号 {number} 不存在（引用链 {' -> '.join(path)}），"
+        f"前置规程清单整体失败",
+        http_status=404,
+        details={"number": number, "path": path})
+
+
+def closure_no_applicable_version(number: str, work_time: str,
+                                  known_as_of: str,
+                                  path: list[str]) -> DomainError:
+    return DomainError(
+        "no_applicable_version",
+        f"规程 {number} 在知悉时刻 {known_as_of} 下、对作业时刻 {work_time} "
+        f"没有已发布且生效（未撤回）的适用正文（引用链 {' -> '.join(path)}），"
+        f"前置规程清单整体失败",
+        http_status=409,
+        details={"number": number, "work_time": work_time,
+                 "known_as_of": known_as_of, "path": path})
+
+
+def prerequisite_cycle(cycle: list[str]) -> DomainError:
+    return DomainError(
+        "prerequisite_cycle",
+        f"前置规程引用存在环：{' -> '.join(cycle)}，不返回部分清单",
+        http_status=409, details={"cycle": cycle})

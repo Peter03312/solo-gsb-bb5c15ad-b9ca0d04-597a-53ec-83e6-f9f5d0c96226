@@ -116,11 +116,14 @@ def main() -> None:
     # 9) 两知悉时刻作业区间对比（见文件下方 _diff_examples）
     _diff_examples(number, published_r1)
 
-    # 10) 撤回误发布的更正（本轮新增；独立规程演示，见 _withdrawal_examples）
+    # 10) 撤回误发布的更正（独立规程演示，见 _withdrawal_examples）
     _withdrawal_examples()
 
     # 11) 作业规程包的固定、取回与复核（独立规程演示，见 _package_examples）
     _package_examples()
+
+    # 12) 前置规程（本轮新增）：携带列表发布/更正，递归解析前置清单
+    _prerequisite_examples()
 
 
 def _withdrawal_examples() -> None:
@@ -307,6 +310,124 @@ def _package_examples() -> None:
                "?known_as_of=2025-01-01T00:00:00Z")
     show("11.7f 复核知悉时刻早于包内知悉时刻 -> 422 review_known_too_early",
          status, res)
+
+
+def _prerequisite_examples() -> None:
+    """前置规程：发布/更正携带前置编号列表，递归解析根及前置规程清单。"""
+    pre1, pre2 = "SOP-DEMO-PRE-101", "SOP-DEMO-PRE-102"
+    root = "SOP-DEMO-PRE-001"
+
+    # 12.1) 先发布两份前置规程（也可先引用、后发布，见 12.6）
+    call("POST", "/api/v1/releases", {
+        "number": pre1,
+        "body": "前置规程：动火作业须办理动火证。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+    })
+    call("POST", "/api/v1/releases", {
+        "number": pre2,
+        "body": "前置规程：进入受限空间须先通风检测。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+    })
+
+    # 12.2) 首次发布根规程并携带前置编号列表（响应回显落库后的列表）
+    status, res = call("POST", "/api/v1/releases", {
+        "number": root,
+        "body": "根规程初版：检修作业总体要求。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": [pre1, pre2],
+    })
+    show("12.2 首次发布携带前置规程编号列表", status, res)
+
+    # 12.3) 更正省略 prerequisites -> 继承被替代版本 r0 的列表
+    status, res = call("POST", "/api/v1/corrections", {
+        "number": root,
+        "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end": "2026-04-01T00:00:00Z",
+        "body": "根规程 3 月更正：检修期加派监护。",
+    })
+    show("12.3 更正省略前置列表 -> 继承被替代版本", status, res)
+
+    # 12.4) 递归解析：前置优先、去重、根在最后，含编号/版本/正文
+    status, res = call(
+        "GET", f"/api/v1/procedures/{root}/closure"
+               "?work_time=2026-03-15T08:00:00Z")
+    show("12.4 前置规程清单（3 月作业，根取更正版 r1）", status, res)
+
+    # 12.5) 显式空列表清空：4 月更正不再携带前置 -> 清单只剩根本身
+    call("POST", "/api/v1/corrections", {
+        "number": root,
+        "base_revision": 0,
+        "valid_start": "2026-04-01T00:00:00Z",
+        "valid_end": "2026-05-01T00:00:00Z",
+        "body": "根规程 4 月更正：不再引用前置规程。",
+        "prerequisites": [],
+    })
+    status, res = call(
+        "GET", f"/api/v1/procedures/{root}/closure"
+               "?work_time=2026-04-15T08:00:00Z")
+    show("12.5 显式空列表清空（4 月作业，清单只剩根）", status, res)
+
+    # 12.6) 前置可晚于引用者发布：先引用后发布，解析从缺口变为成功
+    late_root, late_pre = "SOP-DEMO-PRE-002", "SOP-DEMO-PRE-103"
+    call("POST", "/api/v1/releases", {
+        "number": late_root,
+        "body": "引用尚未发布的前置规程。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": [late_pre],
+    })
+    status, res = call(
+        "GET", f"/api/v1/procedures/{late_root}/closure"
+               "?work_time=2026-03-15T08:00:00Z")
+    show("12.6a 前置尚未发布 -> 404 prerequisite_not_found（带引用链）",
+         status, res)
+    call("POST", "/api/v1/releases", {
+        "number": late_pre,
+        "body": "晚发布的前置规程正文。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+    })
+    status, res = call(
+        "GET", f"/api/v1/procedures/{late_root}/closure"
+               "?work_time=2026-03-15T08:00:00Z")
+    show("12.6b 前置发布后 -> 解析成功", status, res)
+
+    # 12.7) 引用成环 -> 409 prerequisite_cycle，返回环路径、不给部分清单
+    cyc_a, cyc_b = "SOP-DEMO-CYC-A", "SOP-DEMO-CYC-B"
+    call("POST", "/api/v1/releases", {
+        "number": cyc_a, "body": "A 引用 B",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": [cyc_b]})
+    call("POST", "/api/v1/releases", {
+        "number": cyc_b, "body": "B 引用 A",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": [cyc_a]})
+    status, res = call(
+        "GET", f"/api/v1/procedures/{cyc_a}/closure"
+               "?work_time=2026-03-15T08:00:00Z")
+    show("12.7 引用成环 -> 409 prerequisite_cycle（details.cycle 为环路径）",
+         status, res)
+
+    # 12.8) 列表形状校验：重复编号 -> 422；空白编号 -> 422
+    status, res = call("POST", "/api/v1/releases", {
+        "number": "SOP-DEMO-PRE-003", "body": "x",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": [pre1, pre1]})
+    show("12.8a 前置编号重复 -> 422 duplicate_prerequisite_number",
+         status, res)
+    status, res = call("POST", "/api/v1/releases", {
+        "number": "SOP-DEMO-PRE-003", "body": "x",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": ["  "]})
+    show("12.8b 前置编号空白 -> 422 invalid_number", status, res)
 
 
 def _diff_examples(number: str, published_r1: str) -> None:

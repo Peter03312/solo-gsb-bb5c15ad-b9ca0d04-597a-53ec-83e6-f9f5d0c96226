@@ -70,6 +70,20 @@ CREATE TABLE IF NOT EXISTS package_items (
     UNIQUE(package_id, position)
 );
 
+-- 前置规程引用：每个版本各自携带一份有序的前置规程编号列表。
+-- 与版本行同一事务插入、只追加不改写：首次发布省略视为空；更正省略继承
+-- 被替代版本（在写入时复制，基版行不可变，故与按引用继承等价）；显式空
+-- 列表清空。引用是否生效完全由所属版本的双时间维可见性决定（适用区间、
+-- 发布时间、撤回），因此历史查询天然看到当时的前置列表，无需改写历史。
+-- 编号在写入时不校验存在性：前置规程可以晚于引用者发布。
+CREATE TABLE IF NOT EXISTS prerequisites (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id INTEGER NOT NULL REFERENCES versions(id),
+    position   INTEGER NOT NULL,
+    number     TEXT NOT NULL,
+    UNIQUE(version_id, position)
+);
+
 CREATE INDEX IF NOT EXISTS idx_versions_procedure
     ON versions(procedure_id);
 CREATE INDEX IF NOT EXISTS idx_versions_query
@@ -78,6 +92,8 @@ CREATE INDEX IF NOT EXISTS idx_withdrawals_version
     ON withdrawals(version_id);
 CREATE INDEX IF NOT EXISTS idx_package_items_package
     ON package_items(package_id);
+CREATE INDEX IF NOT EXISTS idx_prerequisites_version
+    ON prerequisites(version_id);
 """
 
 _write_lock = threading.Lock()

@@ -112,7 +112,7 @@ curl -sS -i --get "$BASE_URL/api/v1/procedures/SOP-CURL-001/diff" \
   --data-urlencode 'work_end=2026-03-01T00:00:00Z'; echo
 
 # ------------------------------------------------------------------------
-# 撤回（本轮新增）：值班员发现更正误发布时，提交"规程编号 + 更正版本号"。
+# 撤回：值班员发现更正误发布时，提交"规程编号 + 更正版本号"。
 # 撤回时刻 withdrawn_at 由服务端记录、不接受回填；撤回只追加事件、不删版本。
 # 前置数据：r1 为上面第 2 步发布的 3 月更正。
 # ------------------------------------------------------------------------
@@ -177,7 +177,7 @@ curl -sS -i -X POST "$BASE_URL/api/v1/withdrawals" \
       ]}'; echo
 
 # ------------------------------------------------------------------------
-# 作业规程包（本轮新增）：班组开工前按"作业时刻 + 知悉时刻 + 一组规程编号"
+# 作业规程包：班组开工前按"作业时刻 + 知悉时刻 + 一组规程编号"
 # 固定。包一经形成不可变：之后的更正/撤回不影响按标识取回；复核以不早于
 # 包内知悉时刻、不晚于当前时刻的复核知悉时刻逐项核对是否变化。
 # 知悉时刻不得晚于服务端当前时刻，故此处取运行时 UTC（先停顿 1 秒，
@@ -282,3 +282,128 @@ curl -sS -i "$BASE_URL/api/v1/packages/$PKG_ID/review?known_as_of=2025-01-01T00:
 # --- 20f. 取回/复核不存在的包 -> 404 package_not_found --------------------
 curl -sS -i "$BASE_URL/api/v1/packages/0123456789abcdef0123456789abcdef"; echo
 curl -sS -i "$BASE_URL/api/v1/packages/0123456789abcdef0123456789abcdef/review?known_as_of=$NOW"; echo
+
+# ------------------------------------------------------------------------
+# 前置规程（本轮新增）：首次发布与更正可携带前置规程编号列表（发布省略视为
+# 空；更正省略继承被替代版本，显式空列表清空；不校验存在性，前置可晚发布）。
+# 递归解析接口按根编号 + 作业时刻 + 知悉时刻在同一读取快照内展开，返回
+# 去重后的根及前置规程清单（前置优先，含编号、版本、正文）。
+# ------------------------------------------------------------------------
+
+# --- 21. 发布两份前置规程 --------------------------------------------------
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PRE-101",
+        "body": "前置规程：动火作业须办理动火证。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z"
+      }'; echo
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PRE-102",
+        "body": "前置规程：进入受限空间须先通风检测。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z"
+      }'; echo
+
+# --- 22. 首次发布根规程并携带前置编号列表（响应回显落库列表） --------------
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PRE-001",
+        "body": "根规程初版：检修作业总体要求。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z",
+        "prerequisites": ["SOP-PRE-101", "SOP-PRE-102"]
+      }'; echo
+
+# --- 23. 更正省略 prerequisites -> 继承被替代版本 r0 的列表 ----------------
+curl -sS -X POST "$BASE_URL/api/v1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PRE-001",
+        "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end":   "2026-04-01T00:00:00Z",
+        "body": "根规程 3 月更正：检修期加派监护。"
+      }'; echo
+
+# --- 24. 递归解析：前置优先、去重、根在最后，含编号/版本/正文 --------------
+curl -sS "$BASE_URL/api/v1/procedures/SOP-PRE-001/closure?work_time=2026-03-15T08:00:00Z"; echo
+
+# --- 25. 显式空列表清空：4 月更正不再携带前置 -> 清单只剩根本身 ------------
+curl -sS -X POST "$BASE_URL/api/v1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PRE-001",
+        "base_revision": 0,
+        "valid_start": "2026-04-01T00:00:00Z",
+        "valid_end":   "2026-05-01T00:00:00Z",
+        "body": "根规程 4 月更正：不再引用前置规程。",
+        "prerequisites": []
+      }'; echo
+curl -sS "$BASE_URL/api/v1/procedures/SOP-PRE-001/closure?work_time=2026-04-15T08:00:00Z"; echo
+
+# --- 26a. 前置尚未发布 -> 404 prerequisite_not_found（details 带引用链） ---
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PRE-002",
+        "body": "引用尚未发布的前置规程。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z",
+        "prerequisites": ["SOP-PRE-103"]
+      }'; echo
+curl -sS -i "$BASE_URL/api/v1/procedures/SOP-PRE-002/closure?work_time=2026-03-15T08:00:00Z"; echo
+
+# --- 26b. 前置发布后 -> 解析成功（前置可晚于引用者发布） --------------------
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PRE-103",
+        "body": "晚发布的前置规程正文。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z"
+      }'; echo
+curl -sS "$BASE_URL/api/v1/procedures/SOP-PRE-002/closure?work_time=2026-03-15T08:00:00Z"; echo
+
+# --- 27. 引用成环 -> 409 prerequisite_cycle（details.cycle 为环路径） ------
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-CYC-A", "body": "A 引用 B",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z",
+        "prerequisites": ["SOP-CYC-B"]
+      }'; echo
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-CYC-B", "body": "B 引用 A",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z",
+        "prerequisites": ["SOP-CYC-A"]
+      }'; echo
+curl -sS -i "$BASE_URL/api/v1/procedures/SOP-CYC-A/closure?work_time=2026-03-15T08:00:00Z"; echo
+
+# --- 28a. 前置编号重复 -> 422 duplicate_prerequisite_number ----------------
+curl -sS -i -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PRE-003", "body": "x",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z",
+        "prerequisites": ["SOP-PRE-101", "SOP-PRE-101"]
+      }'; echo
+
+# --- 28b. 前置编号空白 -> 422 invalid_number -------------------------------
+curl -sS -i -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PRE-003", "body": "x",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z",
+        "prerequisites": ["  "]
+      }'; echo

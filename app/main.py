@@ -19,7 +19,8 @@ app = FastAPI(
     version="1.0.0",
     description=("双时间维（适用时间 / 发布时间）规程版本库：首次发布、更正、"
                  "误发布更正的撤回（只追加事件）、按作业时刻+知悉时刻回溯查询、"
-                 "两知悉时刻区间对比，以及作业规程包的固定、取回与复核。"),
+                 "两知悉时刻区间对比、作业规程包的固定/取回/复核，以及前置规程"
+                 "清单的递归解析（发布/更正可携带前置编号，按版本生效）。"),
 )
 
 
@@ -66,6 +67,7 @@ def index() -> dict:
                 "GET  /api/v1/effective",
                 "GET  /api/v1/procedures/{number}/history",
                 "GET  /api/v1/procedures/{number}/diff",
+                "GET  /api/v1/procedures/{number}/closure",
             ]}
 
 
@@ -134,6 +136,19 @@ def procedure_diff(number: str, known_before: str, known_after: str,
     """
     return service.compare_interval(number, known_before, known_after,
                                     work_start, work_end)
+
+
+@app.get("/api/v1/procedures/{number}/closure")
+def procedure_closure(number: str, work_time: str,
+                      known_as_of: str | None = None) -> dict:
+    """前置规程清单：班组按根规程准备作业时，连同该时点有效的前置规程核对。
+
+    按现有回溯语义在同一读取快照内递归解析：每个规程取 (作业时刻, 知悉时刻)
+    下的适用版本，并沿该版本携带的前置编号列表展开；返回去重后的根及前置
+    规程清单（前置优先、根在最后，含编号/版本/正文）。根或引用编号不存在、
+    任一规程当时无适用正文 -> 说明缺口并整体失败；引用成环 -> 返回环路径。
+    """
+    return service.resolve_closure(number, work_time, known_as_of)
 
 
 @app.post("/api/v1/packages", status_code=201)
